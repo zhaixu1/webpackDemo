@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const parser = require("@babel/parser");
 let types = require("@babel/types"); //用来生成或者判断节点的AST语法树的节点
+const { log } = require('console');
 const traverse = require("@babel/traverse").default;
 const generator = require("@babel/generator").default
 
@@ -82,7 +83,21 @@ class Compiler {
     run(callback) {
         console.log('this.hooks', this.hooks);
       this.hooks.run.call(); //在编译前触发run钩子执行，表示开始启动编译了
-      const onCompiled = () => {
+      const onCompiled = (err, stats, fileDependencies) => {
+        console.log(err, stats, fileDependencies, 'onCompiled');
+       //第十步：确定好输出内容之后，根据配置的输出路径和文件名，将文件内容写入到文件系统（这里就是硬盘）
+       for (let filename in stats.assets) {
+         let filePath = path.join(this.options.output.path, filename);
+         fs.writeFileSync(filePath, stats.assets[filename], "utf8", (err, data) => {
+          log(err, data);
+         });
+       }    
+      //  callback(err, {
+      //    toJson: () => stats,
+      //  });
+      fileDependencies.forEach((fileDependencie) => {
+        fs.watch(fileDependencie, () => this.compile(onCompiled));
+      });
         this.hooks.done.call(); //当编译成功后会触发done这个钩子执行
       };
       this.compile(onCompiled); //开始编译，成功之后调用onCompiled
@@ -136,9 +151,51 @@ class Compilation {
     //第七步：找出此模块所依赖的模块，再对依赖模块进行编译
     //7.1：先把源代码编译成 [AST](https://astexplorer.net/)
     let ast = parser.parse(sourceCode, {sourceType: "module"})
-    console.log('ast', ast);
-
-    console.log('loaders', loaders);
+    traverse(ast, {
+      CallExpression: (nodePath) =>{
+        const { node } = nodePath;
+        // console.log(node, 'node111');  // 没一行代码进行编译，
+        //7.2：在 `AST` 中查找 `require` 语句，找出依赖的模块名称和绝对路径
+        if(node.callee.name === "require") {
+          let depModuleName = node.arguments[0].value; // 获取依赖模块的名称
+          let dirname = path.posix.dirname(modulePath); // h获取当前正在编译的模块所在目录
+          // console.log(modulePath, dirname, 'dirname');
+          let depModulePath = path.posix.join(dirname, depModuleName); //获取依赖模块的绝对路径
+          let extensions = this.options.resolve?.extensions || [ ".js" ]; //获取配置中的extensions
+          // console.log(this.options, extensions, 'extensions');
+          depModulePath = tryExtensions(depModulePath, extensions); //尝试添加后缀，找到一个真实在硬盘上存在的文件
+          // console.log(depModulePath, 'depModulePath');
+          //7.3：将依赖模块的绝对路径 push 到 `this.fileDependencies` 中
+          this.fileDependencies.push(depModulePath);
+          //7.4：生成依赖模块的`模块 id`
+          let depModuleId = "./" + path.posix.relative(baseDir, depModulePath);
+          //7.5：修改语法结构，把依赖的模块改为依赖`模块 id` require("./name")=>require("./src/name.js")
+          node.arguments = [types.stringLiteral(depModuleId)];
+          //7.6：将依赖模块的信息 push 到该模块的 `dependencies` 属性中
+          module.dependencies.push({ depModuleId, depModulePath });
+        }
+      }
+    })
+    // console.log('ast', ast);
+    //7.7：生成新代码，并把转译后的源代码放到 `module._source` 属性上
+    let { code } = generator(ast);
+    module._source = code;
+    //7.8：对依赖模块进行编译（对 `module 对象`中的 `dependencies` 进行递归执行 `buildModule` ）
+    module.dependencies.forEach(({ depModuleId, depModulePath }) => {
+        //考虑到多入口打包 ：一个模块被多个其他模块引用，不需要重复打包
+      let existModule = this.modules.find((item) => item.id === depModuleId);
+      //如果modules里已经存在这个将要编译的依赖模块了，那么就不需要编译了，直接把此代码块的名称添加到对应模块的names字段里就可以
+      if (existModule) {
+          //names指的是它属于哪个代码块chunk
+        existModule.names.push(name);       
+      } else {
+          //7.9：对依赖模块编译完成后得到依赖模块的 `module 对象`，push 到 `this.modules` 中
+        let depModule = this.buildModule(name, depModulePath);
+        this.modules.push(depModule);       
+      }     
+    });
+    //7.10：等依赖模块全部编译完成后，返回入口模块的 `module` 对象
+    console.log("module111", module);
     return module;
   }
     
@@ -164,12 +221,64 @@ class Compilation {
         let entryModule = this.buildModule(entryName, entryFilePath)
         // 6.3 把入口模块添加到 `this.modules` 数组中
         this.modules.push(entryModule);
+
+        let chunk = {
+          name: entryName, //entryName="main" 代码块的名称
+          entryModule, //此代码块对应的module的对象,这里就是src/index.js 的module对象
+          modules: this.modules.filter((item) => item.names.includes(entryName)), //找出属于该代码块的模块
+        };
+        this.chunks.push(chunk);
+        console.log("chunks", this.chunks);
         console.log("modules", this.modules);
     }
-   callback()
+       //第九步：把各个代码块 `chunk` 转换成一个一个文件加入到输出列表
+      this.chunks.forEach((chunk) => {
+        let filename = this.options.output.filename.replace("[name]", chunk.name);
+        console.log("filename", filename);
+        this.assets[filename] = getSource(chunk);
+      })
+     callback(
+       null,
+       {
+         chunks: this.chunks,
+         modules: this.modules,
+         assets: this.assets,
+       },
+       this.fileDependencies
+     );
   }
 }
 
+//生成运行时代码
+function getSource(chunk) {
+  return `
+   (() => {
+    var modules = {
+      ${chunk.modules.map(
+        (module) => `
+        "${module.id}": (module) => {
+          ${module._source}
+        }
+      `
+      )}  
+    };
+    var cache = {};
+    function require(moduleId) {
+      var cachedModule = cache[moduleId];
+      if (cachedModule !== undefined) {
+        return cachedModule.exports;
+      }
+      var module = (cache[moduleId] = {
+        exports: {},
+      });
+      modules[moduleId](module, module.exports, require);
+      return module.exports;
+    }
+    var exports ={};
+    ${chunk.entryModule._source}
+  })();
+   `;
+}
 
 
 function webpack(webpackOptions) {
