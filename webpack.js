@@ -280,7 +280,7 @@ function getSource(chunk) {
    `;
 }
 
-
+// 定义webpack 函数
 function webpack(webpackOptions) {
     // 获取compiler 对象
     const compiler = new Compiler(webpackOptions);
